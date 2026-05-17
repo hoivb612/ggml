@@ -193,6 +193,25 @@ set(GGML_BLAS_VENDOR ${GGML_BLAS_VENDOR_DEFAULT} CACHE STRING
 option(GGML_LLAMAFILE                       "ggml: use LLAMAFILE"                             ${GGML_LLAMAFILE_DEFAULT})
 
 option(GGML_CUDA                            "ggml: use CUDA"                                  OFF)
+
+# Compatibility aliases for command-line forms that use '-' separators.
+if (DEFINED CACHE{GGML-DX12})
+    set(GGML_DX12 "$CACHE{GGML-DX12}" CACHE BOOL "ggml: use DirectX 12" FORCE)
+endif()
+if (DEFINED CACHE{GGML-DX12X})
+    set(GGML_DX12X "$CACHE{GGML-DX12X}" CACHE BOOL "ggml: use DirectX 12 (smosier flavor)" FORCE)
+endif()
+
+option(GGML_DX12                            "ggml: use DirectX 12"                            OFF)
+option(GGML_DX12_DEBUG                      "ggml: enable DirectX 12 debug output"            OFF)
+option(GGML_DX12X                           "ggml: use DirectX 12 (smosier flavor)"           OFF)
+
+# Exactly one DX12 source flavor may be selected per build (they all produce
+# the same ggml-dx12 target / GGML_USE_DX12 compile def).
+if (GGML_DX12 AND GGML_DX12X)
+    message(FATAL_ERROR "GGML_DX12 and GGML_DX12X are mutually exclusive. Enable only one DX12 source flavor per build directory.")
+endif()
+
 option(GGML_MUSA                            "ggml: use MUSA"                                  OFF)
 option(GGML_CUDA_FORCE_MMQ                  "ggml: use mmq kernels instead of cuBLAS"         OFF)
 option(GGML_CUDA_FORCE_CUBLAS               "ggml: always use cuBLAS instead of mmq kernels"  OFF)
