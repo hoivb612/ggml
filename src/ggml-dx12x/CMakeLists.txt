@@ -14,6 +14,39 @@ ggml_add_backend_library(ggml-dx12
     ../../include/ggml-dx12.h
 )
 
+# ABI auto-detection -----------------------------------------------------------
+# ggml's buffer iface (ggml_backend_buffer_i) and backend iface (ggml_backend_i)
+# grew set_tensor_2d / get_tensor_2d / set_tensor_2d_async / get_tensor_2d_async
+# fields at some point after our pinned base commit. Different consumers of this
+# backend ship different ggml snapshots:
+#   - sd.cpp + our fork (hoivb612/ggml @ ggml-dx12x): pinned old, NO 2D fields
+#   - b612_clean / b612.dc_041126: newer ggml, HAS 2D fields
+#   - upstream ggml-org/ggml @ master: HAS 2D fields
+#
+# Rather than ask each consumer to set a flag, probe the actual header in this
+# build tree and define GGML_DX12X_BUFFER_HAS_2D / GGML_DX12X_BACKEND_HAS_2D_ASYNC
+# accordingly. The C++ source uses these guards to include or omit the
+# corresponding struct initializer lines.
+set(_ggml_impl_h "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-backend-impl.h")
+if (EXISTS "${_ggml_impl_h}")
+    file(READ "${_ggml_impl_h}" _ggml_impl_h_content)
+    if (_ggml_impl_h_content MATCHES "[ \t\\*]set_tensor_2d[ \t]*\\)[^_]")
+        target_compile_definitions(ggml-dx12 PRIVATE GGML_DX12X_BUFFER_HAS_2D=1)
+        message(STATUS "ggml-dx12x: ggml buffer iface HAS set_tensor_2d/get_tensor_2d")
+    else()
+        message(STATUS "ggml-dx12x: ggml buffer iface lacks set_tensor_2d/get_tensor_2d (pinned-old ggml)")
+    endif()
+    if (_ggml_impl_h_content MATCHES "set_tensor_2d_async")
+        target_compile_definitions(ggml-dx12 PRIVATE GGML_DX12X_BACKEND_HAS_2D_ASYNC=1)
+        message(STATUS "ggml-dx12x: ggml backend iface HAS set_tensor_2d_async/get_tensor_2d_async")
+    else()
+        message(STATUS "ggml-dx12x: ggml backend iface lacks set_tensor_2d_async/get_tensor_2d_async (pinned-old ggml)")
+    endif()
+else()
+    message(WARNING "ggml-dx12x: could not find ggml-backend-impl.h at ${_ggml_impl_h} to probe iface ABI")
+endif()
+# -----------------------------------------------------------------------------
+
 if (GGML_DX12_XBOX)
     # ---- Xbox Series X (Scarlett, GDKX) cross-compile branch ----
     #

@@ -2082,10 +2082,11 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
             D3D12_RANGE written = { 0, 0 };
             ctx->dev->xfer.readback_staging->Unmap(0, &written);
         },
-#ifndef SD_DX12X
-        // sd.cpp's pinned ggml predates the buffer iface 2D fields; skip them
-        // there. All other consumers (b612_clean, b612.dc_041126, mainline)
-        // have these fields and require the initializers.
+#ifdef GGML_DX12X_BUFFER_HAS_2D
+        // ggml's buffer iface includes 2D-transfer fields (newer ggml).
+        // Detected at configure time by ggml-dx12x/CMakeLists.txt probing
+        // ggml-backend-impl.h; if the field isn't there, the initializers
+        // here are omitted entirely.
         /* .set_tensor_2d = */ nullptr,
         /* .get_tensor_2d = */ nullptr,
 #endif
@@ -5815,9 +5816,10 @@ static const ggml_backend_i dx12_backend_interface = {
     /* .free                = */ dx12_backend_free,
     /* .set_tensor_async    = */ dx12_backend_set_tensor_async,
     /* .get_tensor_async    = */ dx12_backend_get_tensor_async,
-#ifndef SD_DX12X
-    // sd.cpp's pinned ggml predates the backend iface 2D-async fields; skip
-    // them there. All other consumers have these fields.
+#ifdef GGML_DX12X_BACKEND_HAS_2D_ASYNC
+    // ggml's backend iface includes 2D-async fields (newer ggml). Probed
+    // at configure time by ggml-dx12x/CMakeLists.txt; older pinned ggmls
+    // lack these fields and the initializers below are omitted.
     /* .set_tensor_2d_async = */ nullptr,
     /* .get_tensor_2d_async = */ nullptr,
 #endif
