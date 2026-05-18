@@ -233,6 +233,7 @@ if (DXC_EXECUTABLE)
         mul_mat_vec_q6k_mr
         mul_mat_vec_q5_0_mr
         mul_mat_vec_q5_1_mr
+        mul_mat_vec_q4_0_mr
         mul_mat_vec_q8_0_mr
         mul_mat_vec_q8_0_mr256v
         mul_mat_vec_glu
@@ -271,6 +272,8 @@ if (DXC_EXECUTABLE)
     # Shaders requiring SM 6.6 (dot4add_i8packed / dp4a — built at 6.6 with rest)
     set(DX12_SHADERS_SM64
         mul_mat_q8_0_q8_1
+        mul_mat_q4_0_q8_1
+        mul_mat_q4_0_q8_1_tiled
         mul_mat_vec_q4k_dp4a
         mul_mat_vec_q4k_dp4a_32
         mul_mat_vec_q5k_dp4a
@@ -279,6 +282,7 @@ if (DXC_EXECUTABLE)
         mul_mat_vec_q8_0_dp4a
         mul_mat_vec_q5_0_dp4a
         mul_mat_vec_q5_1_dp4a
+        mul_mat_vec_q4_0_dp4a
     )
 
     set(DX12_SHADER_HEADERS "")

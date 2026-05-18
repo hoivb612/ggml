@@ -2082,6 +2082,13 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
             D3D12_RANGE written = { 0, 0 };
             ctx->dev->xfer.readback_staging->Unmap(0, &written);
         },
+#ifndef SD_DX12X
+        // sd.cpp's pinned ggml predates the buffer iface 2D fields; skip them
+        // there. All other consumers (b612_clean, b612.dc_041126, mainline)
+        // have these fields and require the initializers.
+        /* .set_tensor_2d = */ nullptr,
+        /* .get_tensor_2d = */ nullptr,
+#endif
         /* .cpy_tensor    = */ nullptr,
         /* .clear         = */ [](ggml_backend_buffer_t buffer, uint8_t value) {
             auto * ctx = (dx12_buffer_context *)buffer->context;
@@ -3199,7 +3206,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         // the per-vendor gates below allow it.
         //
         // Debug: DX12_NO_DP4A=1 disables every dp4a-based shader path
-        // (matvec flags 8, 10, 13, 14, 16, 17, 21, 22, 23 + the batch dp4a
+        // (matvec flags 8, 10, 13, 14, 16, 17, 21, 22, 23, 25 + the batch dp4a
         // flag=8). All quantized matmuls fall back to the non-dp4a multi-row
         // or flat shaders. Useful for isolating dp4a-specific correctness
         // issues on platforms where dot4add_i8packed codegen may differ from
@@ -3210,8 +3217,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             ggml_type t = node->src[0]->type;
             if (t == GGML_TYPE_F16 || t == GGML_TYPE_F32 || t == GGML_TYPE_BF16 ||
                 t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K ||
-                t == GGML_TYPE_Q6_K || t == GGML_TYPE_Q5_0 ||
-                t == GGML_TYPE_Q5_1 ||
+                t == GGML_TYPE_Q6_K || t == GGML_TYPE_Q4_0 ||
+                t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q5_1 ||
                 t == GGML_TYPE_Q2_K || t == GGML_TYPE_Q3_K ||
                 t == GGML_TYPE_IQ4_NL ||
                 t == GGML_TYPE_Q8_0) {
@@ -3242,8 +3249,9 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         key.flags = use_256 ? 11 : 12;
                     }
                 }
-                // Q5_K/Q6_K/Q8_0/Q5_0/Q5_1 multi-row matvec
+                // Q5_K/Q6_K/Q8_0/Q4_0/Q5_0/Q5_1 multi-row matvec
                 if (t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q6_K || t == GGML_TYPE_Q8_0 ||
+                    t == GGML_TYPE_Q4_0 ||
                     t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q5_1) {
                     key.flags = 9;
                 }
@@ -3340,11 +3348,12 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         use_dp4a_matvec = true;  // triggers Q8_1 quantize pre-pass
                     }
                 }
-                // Q5_0 / Q5_1 dp4a multi-row matvec (dot4add_i8packed + Q8_1 activations)
-                // Same gating as Q4_K dp4a: requires SM 6.4 dp4a, non-tiny wave,
-                // F32 contiguous src1, K%32==0 (Q5 block size = 32). Skip on NVIDIA
-                // for safety (Q4_K/Q5_K dp4a were observed to drift there).
-                if (t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q5_1) {
+                // Q4_0 / Q5_0 / Q5_1 dp4a multi-row matvec (dot4add_i8packed +
+                // Q8_1 activations). Same gating as Q4_K dp4a: requires SM 6.4
+                // dp4a, non-tiny wave, F32 contiguous src1, K%32==0 (Q4_0/Q5_0/
+                // Q5_1 block size = 32). Skip on NVIDIA for safety (Q4_K/Q5_K
+                // dp4a were observed to drift there).
+                if (t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q5_1) {
                     constexpr UINT VENDOR_NVIDIA = 0x10DE;
                     bool nvidia = (bctx->dev->adapter_desc.VendorId == VENDOR_NVIDIA);
                     bool small_wave = (bctx->dev->wave_size < 16);
@@ -3353,7 +3362,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         node->src[1] && node->src[1]->type == GGML_TYPE_F32 &&
                         ggml_is_contiguous(node->src[1]) &&
                         (node->src[1]->ne[0] % 32) == 0) {
-                        key.flags = (t == GGML_TYPE_Q5_0) ? 21 : 22;
+                        key.flags = (t == GGML_TYPE_Q4_0) ? 25 :
+                                    (t == GGML_TYPE_Q5_0) ? 21 : 22;
                         use_dp4a_matvec = true;  // triggers Q8_1 quantize pre-pass
                     }
                 }
@@ -3385,6 +3395,41 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 } else {
                     key.flags = 4;
                 }
+            }
+
+            // Q4_0 batched: no wmma shader exists for it; the legacy flat
+            // shader (key.src0_type == Q4_0 fallback) is bandwidth-bound and
+            // ~10x slower than expected on prefill. Route to the new
+            // mul_mat_q4_0_q8_1 (dp4a + Q8_1 activations) when dp4a is
+            // available. Same gating as the Q8_0 dp4a path: F32 contiguous
+            // src1, K%32==0.
+            //
+            // Two dp4a variants:
+            //   flag=27 (tiled): cooperative groupshared activation tile.
+            //                    Requires (ne[0] % GROUP_SIZE == 0) so that
+            //                    every thread in a group lands on the same
+            //                    (i1,i2,i3) and therefore the same activation
+            //                    row.  If only `>= 256` is enforced but ne[0]
+            //                    is not divisible by 256, groups span two M
+            //                    rows and threads in the wrong half use the
+            //                    wrong activation -> visible as spatial blur
+            //                    on SD UNet outputs (ne[0]=320/640 etc).
+            //                    ~2x over the flat variant when applicable.
+            //   flag=26 (flat):  per-thread global activation reads. Used when
+            //                    the tile precondition is not met.
+            if (t == GGML_TYPE_Q4_0 &&
+                bctx->dev->dp4a_supported && allow_dp4a &&
+                node->src[1] && node->src[1]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(node->src[1]) &&
+                (node->src[1]->ne[0] % 32) == 0) {
+                static const bool force_flat = (getenv("DX12_FORCE_Q4_0_BATCH_FLAT") != nullptr);
+                const bool tile_safe = (node->ne[0] >= 256) && ((node->ne[0] % 256) == 0);
+                if (!force_flat && tile_safe) {
+                    key.flags = 27;  // mul_mat_q4_0_q8_1_tiled (cooperative smem tile)
+                } else {
+                    key.flags = 26;  // mul_mat_q4_0_q8_1 (flat fallback)
+                }
+                use_dp4a = true;
             }
         }
 
@@ -5770,6 +5815,12 @@ static const ggml_backend_i dx12_backend_interface = {
     /* .free                = */ dx12_backend_free,
     /* .set_tensor_async    = */ dx12_backend_set_tensor_async,
     /* .get_tensor_async    = */ dx12_backend_get_tensor_async,
+#ifndef SD_DX12X
+    // sd.cpp's pinned ggml predates the backend iface 2D-async fields; skip
+    // them there. All other consumers have these fields.
+    /* .set_tensor_2d_async = */ nullptr,
+    /* .get_tensor_2d_async = */ nullptr,
+#endif
     /* .cpy_tensor_async    = */ dx12_backend_cpy_tensor_async,
     /* .synchronize         = */ dx12_backend_synchronize,
     /* .graph_plan_create   = */ nullptr,
@@ -6184,6 +6235,12 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
     } else if (key.op == GGML_OP_MUL_MAT && key.flags == 8) {
         // dp4a batch MUL_MAT: Q8_0 weights × Q8_1 quantized input
         const dx12_shader_blob dp4a_blob = WBLOB(mul_mat_q8_0_q8_1); blob = &dp4a_blob;
+    } else if (key.op == GGML_OP_MUL_MAT && key.flags == 26) {
+        // dp4a batch MUL_MAT: Q4_0 weights × Q8_1 quantized input (flat: per-thread global activation reads)
+        const dx12_shader_blob q40_q81_blob = WBLOB(mul_mat_q4_0_q8_1); blob = &q40_q81_blob;
+    } else if (key.op == GGML_OP_MUL_MAT && key.flags == 27) {
+        // dp4a batch MUL_MAT: Q4_0 weights × Q8_1 quantized input (tiled: groupshared activation tile)
+        const dx12_shader_blob q40_q81t_blob = WBLOB(mul_mat_q4_0_q8_1_tiled); blob = &q40_q81t_blob;
     } else if (key.op == GGML_OP_NONE && key.flags == 99) {
         // Quantize F32 → Q8_1
         const dx12_shader_blob q_blob = WBLOB(quantize_q8_1); blob = &q_blob;
@@ -6199,6 +6256,8 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
             const dx12_shader_blob mv_q80_mr_blob = WBLOB(mul_mat_vec_q8_0_mr); blob = &mv_q80_mr_blob;
         } else if (key.src0_type == GGML_TYPE_Q5_0) {
             const dx12_shader_blob mv_q50_mr_blob = WBLOB(mul_mat_vec_q5_0_mr); blob = &mv_q50_mr_blob;
+        } else if (key.src0_type == GGML_TYPE_Q4_0) {
+            const dx12_shader_blob mv_q40_mr_blob = WBLOB(mul_mat_vec_q4_0_mr); blob = &mv_q40_mr_blob;
         } else if (key.src0_type == GGML_TYPE_Q5_1) {
             const dx12_shader_blob mv_q51_mr_blob = WBLOB(mul_mat_vec_q5_1_mr); blob = &mv_q51_mr_blob;
         }
@@ -6243,6 +6302,9 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
         // Two F16 matvecs sharing the same activation, collapsed into one
         // K-loop, output = silu(gate) * up.
         const dx12_shader_blob mv_glu_blob = WBLOB(mul_mat_vec_glu); blob = &mv_glu_blob;
+    } else if (key.op == GGML_OP_MUL_MAT && key.flags == 25) {
+        // Q4_0 dp4a multi-row matvec (dot4add_i8packed + Q8_1 activations)
+        const dx12_shader_blob mv_q40_dp4a_blob = WBLOB(mul_mat_vec_q4_0_dp4a); blob = &mv_q40_dp4a_blob;
     } else if (key.op == GGML_OP_MUL_MAT && key.flags == 11) {
         // F16/F32 multi-row matvec — 256 threads (2 rows per group)
         const dx12_shader_blob mv_mr_blob = WBLOB(mul_mat_vec_mr); blob = &mv_mr_blob;
@@ -6251,8 +6313,8 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
         const dx12_shader_blob mv_mr32_blob = WBLOB(mul_mat_vec_mr32); blob = &mv_mr32_blob;
     } else if (key.op == GGML_OP_MUL_MAT && key.flags == 1) {
         // Matvec path (M=1) — only Q2_K/Q3_K/BF16 actually reach here today.
-        // Q4_K/Q5_K/Q6_K/Q5_0/Q5_1/Q8_0 are routed by their dedicated flags
-        // (9-18) earlier in the dispatch path; F16/F32 use flags=11 or 12.
+        // Q4_K/Q5_K/Q6_K/Q4_0/Q5_0/Q5_1/Q8_0 are routed by their dedicated flags
+        // (9-18, 25) earlier in the dispatch path; F16/F32 use flags=11 or 12.
         if (key.src0_type == GGML_TYPE_Q2_K) {
             const dx12_shader_blob mv_q2k_blob = WBLOB(mul_mat_vec_q2k); blob = &mv_q2k_blob;
         } else if (key.src0_type == GGML_TYPE_Q3_K) {
