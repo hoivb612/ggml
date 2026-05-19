@@ -47,14 +47,26 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             float x2 = asfloat(x4.z); float x3 = asfloat(x4.w);
 
             // Row 0 weights
+#if NATIVE_FP16
+            vector<float16_t,4> wh0 = src0.Load<vector<float16_t,4> >(src0_row0 + k * 2);
+            acc0 = mad((float)wh0.x, x0, mad((float)wh0.y, x1,
+                   mad((float)wh0.z, x2, mad((float)wh0.w, x3, acc0))));
+#else
             uint2 w4_0 = src0.Load2(src0_row0 + k * 2);
             acc0 = mad(f16tof32(w4_0.x & 0xFFFFu), x0, mad(f16tof32(w4_0.x >> 16), x1,
                    mad(f16tof32(w4_0.y & 0xFFFFu), x2, mad(f16tof32(w4_0.y >> 16), x3, acc0))));
+#endif
 
             // Row 1 weights
+#if NATIVE_FP16
+            vector<float16_t,4> wh1 = src0.Load<vector<float16_t,4> >(src0_row1 + k * 2);
+            acc1 = mad((float)wh1.x, x0, mad((float)wh1.y, x1,
+                   mad((float)wh1.z, x2, mad((float)wh1.w, x3, acc1))));
+#else
             uint2 w4_1 = src0.Load2(src0_row1 + k * 2);
             acc1 = mad(f16tof32(w4_1.x & 0xFFFFu), x0, mad(f16tof32(w4_1.x >> 16), x1,
                    mad(f16tof32(w4_1.y & 0xFFFFu), x2, mad(f16tof32(w4_1.y >> 16), x3, acc1))));
+#endif
         }
         // Remainder
         for (; k < K; k++) {

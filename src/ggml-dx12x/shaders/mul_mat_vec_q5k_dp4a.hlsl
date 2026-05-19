@@ -23,7 +23,9 @@
 #define Q8_1_BSIZE  36
 #define NUM_ROWS    2
 
-groupshared float shared_acc[64];
+// Wave-portable reduction LDS. See mul_mat_vec_q4k_dp4a.hlsl for rationale.
+groupshared float shared_acc0[64];
+groupshared float shared_acc1[64];
 
 // Decode Q5_K scales + 5-bit values for one row's superblock.
 // q_offset and l0 use stride-4 indexing (l0 = 4*(2*ir+v_in)) so all
@@ -217,34 +219,30 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
         }
     }
 
-    // Two-level reduction with tree reduction (matches Q4_K dp4a)
+    // Wave-portable reduction. See mul_mat_vec_q4k_dp4a.hlsl for rationale.
     float wave_sum0 = WaveActiveSum(acc0);
     float wave_sum1 = WaveActiveSum(acc1);
-    uint wave_id = tid / WARP_SIZE;
-    uint num_waves = GROUP_SIZE / WARP_SIZE;
+    uint wave_lanes = WaveGetLaneCount();
+    uint wave_id = tid / wave_lanes;
+    uint num_waves = (GROUP_SIZE + wave_lanes - 1) / wave_lanes;
+    if (num_waves == 0) num_waves = 1;
 
     if (WaveIsFirstLane()) {
-        shared_acc[wave_id] = wave_sum0;
-        shared_acc[32 + wave_id] = wave_sum1;
+        shared_acc0[wave_id] = wave_sum0;
+        shared_acc1[wave_id] = wave_sum1;
     }
     GroupMemoryBarrierWithGroupSync();
 
-    for (uint s = num_waves / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            shared_acc[tid] += shared_acc[tid + s];
-            shared_acc[32 + tid] += shared_acc[32 + tid + s];
-        }
-        GroupMemoryBarrierWithGroupSync();
-    }
-
     if (tid == 0) {
-        float result0 = shared_acc[0];
+        float result0 = shared_acc0[0];
+        for (uint w = 1; w < num_waves; w++) result0 += shared_acc0[w];
         result0 += load_fused_bias(row0, i2, i3);
         uint off_d0 = offset_4d(row0, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
         store_auto(dst, off_d0, result0, dst_esize);
 
         if (row0 + 1 < ne0) {
-            float result1 = shared_acc[32];
+            float result1 = shared_acc1[0];
+            for (uint w = 1; w < num_waves; w++) result1 += shared_acc1[w];
             result1 += load_fused_bias(row0 + 1, i2, i3);
             uint off_d1 = offset_4d(row0 + 1, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
             store_auto(dst, off_d1, result1, dst_esize);

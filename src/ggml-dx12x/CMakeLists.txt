@@ -210,8 +210,10 @@ if (DXC_EXECUTABLE)
         mul_mat_id_q5_1
         mul_mat_id_q8_0
         mul_mat_id_q4k
+        mul_mat_id_q4k_dp4a
         mul_mat_id_q5k
         mul_mat_id_q6k
+        mul_mat_id_q6k_dp4a
         mul_mat_id_iq4_nl
         cpy
         get_rows
@@ -264,7 +266,17 @@ if (DXC_EXECUTABLE)
         mul_mat_vec_q5k_mr
         mul_mat_vec_q5k_subgroup
         mul_mat_vec_q6k_mr
+        mul_mat_vec_q6k_mr_blocked
+        mul_mat_vec_q3k_mr_blocked
+        mul_mat_vec_q2k_mr_blocked
+        mul_mat_vec_q8_0_mr64
+        mul_mat_vec_q5_0_mr64
         mul_mat_vec_q5_0_mr
+        mul_mat_vec_q5_0_mr_lds
+        mul_mat_vec_glu_q5_0
+        mul_mat_vec_glu_q4_k
+        mul_mat_vec_glu_q5_k
+        mul_mat_vec_glu_q8_0
         mul_mat_vec_q5_1_mr
         mul_mat_vec_q4_0_mr
         mul_mat_vec_q8_0_mr
@@ -293,9 +305,20 @@ if (DXC_EXECUTABLE)
         get_rows_q3k
         mul_mat_iq4_nl
         mul_mat_vec_iq4_nl
+        mul_mat_vec_iq4_nl_mr
         get_rows_iq4_nl
+        mul_mat_vec_iq2_xxs
+        mul_mat_vec_iq2_xxs_mr
+        mul_mat_vec_iq4_xs
+        mul_mat_vec_iq3_xxs
+        mul_mat_vec_iq2_xs
+        mul_mat_vec_iq2_s
+        mul_mat_vec_iq3_s
+        mul_mat_vec_iq1_s
+        mul_mat_vec_iq1_m
         mul_mat_wmma
         mul_mat_q4k_wmma
+        mul_mat_q4k_wmma_lds
         mul_mat_q5k_wmma
         mul_mat_q6k_wmma
         mul_mat_q8_0_wmma
@@ -307,6 +330,7 @@ if (DXC_EXECUTABLE)
         mul_mat_q8_0_q8_1
         mul_mat_q4_0_q8_1
         mul_mat_q4_0_q8_1_tiled
+        mul_mat_vec_q4_0_dp4a
         mul_mat_vec_q4k_dp4a
         mul_mat_vec_q4k_dp4a_32
         mul_mat_vec_q5k_dp4a
@@ -315,7 +339,18 @@ if (DXC_EXECUTABLE)
         mul_mat_vec_q8_0_dp4a
         mul_mat_vec_q5_0_dp4a
         mul_mat_vec_q5_1_dp4a
-        mul_mat_vec_q4_0_dp4a
+    )
+
+    # Shaders compiled twice: once FP32-only and once with native 16-bit types
+    # enabled (-enable-16bit-types + -DNATIVE_FP16=1). Runtime selects the FP16
+    # variant on devices that report OPTIONS4.Native16BitShaderOpsSupported.
+    set(DX12_SHADERS_FP16_VARIANT
+        mul_mat_vec
+        mul_mat_vec_mr
+        mul_mat_vec_mr32
+        mul_mat_vec_glu
+        flash_attn
+        flash_attn_gqa
     )
 
     set(DX12_SHADER_HEADERS "")
@@ -416,6 +451,38 @@ if (DXC_EXECUTABLE)
             )
             list(APPEND DX12_SHADER_HEADERS ${shader_hdr})
         endforeach()
+
+        # FP16 variant: same source, compiled with -enable-16bit-types and
+        # NATIVE_FP16=1 so the shader can opt into native float16_t paths via
+        # `#ifdef NATIVE_FP16`. Runtime picks this blob when the device reports
+        # OPTIONS4.Native16BitShaderOpsSupported.
+        foreach(shader_name ${DX12_SHADERS_FP16_VARIANT})
+            set(shader_src "${SHADER_INPUT_DIR}/${shader_name}.hlsl")
+            set(shader_hdr "${SHADER_OUTPUT_DIR}/${shader_name}_w${WSIZE}_fp16_dxil.h")
+
+            set(SHADER_DXC_FLAGS ${DXC_COMMON_FLAGS})
+            if(shader_name IN_LIST DX12_SHADERS_NO_FINITE_MATH)
+                list(REMOVE_ITEM SHADER_DXC_FLAGS -ffinite-math-only)
+            endif()
+
+            add_custom_command(
+                OUTPUT ${shader_hdr}
+                COMMAND ${DXC_EXECUTABLE}
+                    -T cs_6_6
+                    -E main
+                    -Fh ${shader_hdr}
+                    -Vn g_${shader_name}_w${WSIZE}_fp16_dxil
+                    -I ${SHADER_INPUT_DIR}
+                    ${SHADER_DXC_FLAGS}
+                    -enable-16bit-types
+                    -D WAVE_SIZE=${WSIZE}
+                    -D NATIVE_FP16=1
+                    ${shader_src}
+                DEPENDS ${shader_src} ${SHADER_INCLUDE_DEPS}
+                COMMENT "Compiling HLSL shader (FP16): ${shader_name} (wave=${WSIZE})"
+            )
+            list(APPEND DX12_SHADER_HEADERS ${shader_hdr})
+        endforeach()
     endforeach()
 
     # Generate a master include header
@@ -427,6 +494,9 @@ if (DXC_EXECUTABLE)
         endforeach()
         foreach(shader_name ${DX12_SHADERS_SM64})
             string(APPEND SHADER_INCLUDES "#include \"${shader_name}_w${WSIZE}_dxil.h\"\n")
+        endforeach()
+        foreach(shader_name ${DX12_SHADERS_FP16_VARIANT})
+            string(APPEND SHADER_INCLUDES "#include \"${shader_name}_w${WSIZE}_fp16_dxil.h\"\n")
         endforeach()
     endforeach()
     file(WRITE "${SHADER_MASTER_HEADER}" "// Auto-generated shader includes\n#pragma once\n${SHADER_INCLUDES}")

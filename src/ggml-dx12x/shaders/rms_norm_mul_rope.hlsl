@@ -1,23 +1,30 @@
-// rms_norm_mul_rope.hlsl - Fused RMS_NORM + MUL + ROPE
-// Normalizes, multiplies by weight, then applies rotary embedding in one dispatch
-// Eliminates 1 dispatch (ROPE) per layer
+// rms_norm_mul_rope.hlsl - 3-way fused op
+// RMS_NORM + MUL + ROPE in one dispatch
+// Mirrors rms_norm_mul_rope_set_rows.hlsl's structure (which is known to
+// produce coherent output on Qwen3 K-side QK-Norm). The only differences
+// vs the 5-way version are:
+//   - no SET_ROWS row index (src3 is freq_factors here, not row_idx)
+//   - dst write uses src0 strides (offset_4d) since output is normal
+//     contiguous tensor, not a KV cache view
 //
 // src0: input to normalize (F32)
 // src1: RMS norm weights (F32)
 // src2: ROPE position indices (I32)
-// src3: ROPE freq_factors (F32, optional — bound when has_ff != 0)
+// src3: ROPE freq_factors (F32, optional - bound when has_ff != 0)
 // dst:  rotated output (F32)
 //
 // op_params[0]: epsilon (float)
-// op_params[1..7]: ROPE params (n_dims, mode, freq_base, freq_scale, etc.)
-//   [1]=n_dims, [2]=mode, [5]=freq_base(float), [6]=freq_scale(float)
-//   [7]=ext_factor(float; YaRN extrapolation factor)
+// op_params[1]: n_dims (uint)
+// op_params[2]: mode (uint)
 // op_params[3]: corr_high (float, host-precomputed YaRN range max)
 // op_params[4]: corr_low  (float, host-precomputed YaRN range min)
+// op_params[5]: freq_base (float)
+// op_params[6]: freq_scale (float)
+// op_params[7]: ext_factor (float)
 // op_params[10]: ROPE position indices src offset
 // op_params[12]: ROPE position indices nb0
-// op_params[14]: attn_factor (float)  — set host-side (shader-specific slot)
-// op_params[15]: has_ff (uint)        — set host-side (shader-specific slot)
+// op_params[14]: attn_factor (float)
+// op_params[15]: has_ff (uint)
 
 #include "ggml_common.hlsli"
 #include "rope_yarn.hlsli"
@@ -25,18 +32,18 @@
 #define BLOCK_SIZE 256
 
 groupshared float wave_sums[16];
-groupshared float norm_data[1024];  // max ne00 for shared memory pass to ROPE
+groupshared float norm_data[1024];
 
 [numthreads(BLOCK_SIZE, 1, 1)]
 void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     uint row = gid.x;
-    uint total_rows = ne1 * ne2 * ne3;
+    uint total_rows = ne01 * ne02 * ne03;
     if (row >= total_rows) return;
 
-    uint i3 = row / (ne1 * ne2);
-    uint rem = row % (ne1 * ne2);
-    uint i2 = rem / ne1;
-    uint i1 = rem % ne1;
+    uint i3 = row / (ne01 * ne02);
+    uint rem = row % (ne01 * ne02);
+    uint i2 = rem / ne01;
+    uint i1 = rem % ne01;
 
     uint local_id = gtid.x;
     uint wave_count = BLOCK_SIZE / WARP_SIZE;
@@ -44,7 +51,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
 
     float eps = op_param_f32(0);
 
-    // Phase 1: RMS_NORM — compute sum of squares
+    // Phase 1: RMS_NORM
     precise float local_sum = 0.0f;
     for (uint i0 = local_id; i0 < ne00; i0 += BLOCK_SIZE) {
         uint off = offset_4d(i0, i1, i2, i3, nb00, nb01, nb02, nb03, src0_offset);
@@ -65,41 +72,40 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
 
     float scale_val = rsqrt(total / (float)ne00 + eps);
 
-    // Phase 2: Normalize, multiply by weight, store to shared memory for ROPE
+    // Phase 2: Normalize + multiply by weight -> shared memory
     for (uint i0 = local_id; i0 < ne00; i0 += BLOCK_SIZE) {
         uint off_src = offset_4d(i0, i1, i2, i3, nb00, nb01, nb02, nb03, src0_offset);
         uint off_wt = offset_4d(i0 % ne10, i1 % ne11, i2 % ne12, i3 % ne13,
                                 nb10, nb11, nb12, nb13, src1_offset);
         float val = asfloat(src0.Load(off_src));
         float wt = load_auto(src1, off_wt, src1_esize);
-        float normed = val * scale_val * wt;
-        if (i0 < 1024) norm_data[i0] = normed;
+        if (i0 < 1024) norm_data[i0] = val * scale_val * wt;
     }
     GroupMemoryBarrierWithGroupSync();
 
-    // Phase 3: ROPE — apply rotary position embedding
-    uint  n_dims      = op_param_uint(1);
-    uint  mode        = op_param_uint(2);
-    float freq_base   = op_param_f32(5);
-    float freq_scale  = op_param_f32(6);
-    float ext_factor  = op_param_f32(7);
-    float corr_high   = op_param_f32(3);
-    float corr_low    = op_param_f32(4);
-    float attn_factor = op_param_f32(14);
-    uint  has_ff      = op_param_uint(15);
+    // Phase 3: ROPE
+    uint  n_dims        = op_param_uint(1);
+    uint  mode          = op_param_uint(2);
+    float freq_base     = op_param_f32(5);
+    float freq_scale    = op_param_f32(6);
+    float ext_factor    = op_param_f32(7);
+    float corr_high     = op_param_f32(3);
+    float corr_low      = op_param_f32(4);
+    uint  pos_offset    = op_param_uint(10);
+    uint  pos_nb0       = op_param_uint(12);
+    float attn_factor   = op_param_f32(14);
+    uint  has_ff        = op_param_uint(15);
 
     bool is_neox = (mode & 2u) != 0;
     uint half_dims = n_dims / 2;
 
-    // Position from src2 (int32)
-    uint pos_off = op10 + i2 * 4;  // src2 offset for this position
-    int pos = asint(src2.Load(pos_off));
+    int pos = asint(src2.Load(pos_offset + i2 * pos_nb0));
 
     for (uint pair = local_id; pair < ne00 / 2; pair += BLOCK_SIZE) {
         uint idx_a, idx_b;
 
         if (pair >= half_dims) {
-            // Passthrough: copy from shared mem to output
+            // Passthrough for partial-rotation models
             uint pass_idx = n_dims + 2 * (pair - half_dims);
             if (pass_idx < ne00) {
                 uint od = offset_4d(pass_idx, i1, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
@@ -112,13 +118,8 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             continue;
         }
 
-        if (is_neox) {
-            idx_a = pair;
-            idx_b = pair + half_dims;
-        } else {
-            idx_a = pair * 2;
-            idx_b = pair * 2 + 1;
-        }
+        if (is_neox) { idx_a = pair; idx_b = pair + half_dims; }
+        else { idx_a = pair * 2; idx_b = pair * 2 + 1; }
 
         float theta_extrap = (float)pos * exp2(-(float)(pair * 2) / (float)n_dims * log2(freq_base));
         if (has_ff != 0u) {
@@ -132,9 +133,13 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         float x0 = norm_data[idx_a];
         float x1 = norm_data[idx_b];
 
+        float rot_a = x0 * cos_theta - x1 * sin_theta;
+        float rot_b = x0 * sin_theta + x1 * cos_theta;
+
         uint od_a = offset_4d(idx_a, i1, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
         uint od_b = offset_4d(idx_b, i1, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
-        dst.Store(od_a, asuint(x0 * cos_theta - x1 * sin_theta));
-        dst.Store(od_b, asuint(x0 * sin_theta + x1 * cos_theta));
+
+        dst.Store(od_a, asuint(rot_a));
+        dst.Store(od_b, asuint(rot_b));
     }
 }

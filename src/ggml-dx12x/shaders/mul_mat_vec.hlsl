@@ -37,11 +37,20 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         // F16 weights + contiguous F32 input: paired loads + mad()
         uint k = tid * 2;
         for (; k + 1 < K; k += GROUP_SIZE * 2) {
+#if NATIVE_FP16
+            // Native 16-bit path: templated Load emits native HW fp16 unpack
+            // (no f16tof32). Multiply against F32 input — accumulator stays F32
+            // to preserve precision (no f16acc opt-in here).
+            vector<float16_t,2> wh = src0.Load<vector<float16_t,2> >(src0_base + k * 2);
+            uint2 xp = src1.Load2(src1_base + k * 4);
+            acc = mad((float)wh.x, asfloat(xp.x), mad((float)wh.y, asfloat(xp.y), acc));
+#else
             uint w2 = src0.Load(src0_base + k * 2);
             float w0 = f16tof32(w2 & 0xFFFFu);
             float w1 = f16tof32(w2 >> 16);
             uint2 xp = src1.Load2(src1_base + k * 4);
             acc = mad(w0, asfloat(xp.x), mad(w1, asfloat(xp.y), acc));
+#endif
         }
         if (k < K) {
             acc += load_auto(src0, src0_base + k * 2, 2) * asfloat(src1.Load(src1_base + k * 4));

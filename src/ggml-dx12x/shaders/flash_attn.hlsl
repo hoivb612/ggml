@@ -134,6 +134,21 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
                     if (d < D) {
                         dot += asfloat(src0.Load(q_base + d * 4)) * asfloat(src1.Load(k_base + d * 4));
                     }
+#if NATIVE_FP16
+                } else if (src0_esize == 4 && nb00 == 4 && src1_esize == 2 && nb10 == 2) {
+                    // Q = contiguous F32, K = contiguous F16 (typical KV-cache case).
+                    // Native fp16 path: load 4 K halves at once via templated Load.
+                    uint d = 0;
+                    for (; d + 3 < D; d += 4) {
+                        uint4 qp = src0.Load4(q_base + d * 4);
+                        vector<float16_t,4> kh = src1.Load<vector<float16_t,4> >(k_base + d * 2);
+                        dot = mad(asfloat(qp.x), (float)kh.x, mad(asfloat(qp.y), (float)kh.y,
+                              mad(asfloat(qp.z), (float)kh.z, mad(asfloat(qp.w), (float)kh.w, dot))));
+                    }
+                    for (; d < D; d++) {
+                        dot += asfloat(src0.Load(q_base + d * 4)) * load_auto(src1, k_base + d * 2, 2);
+                    }
+#endif
                 } else {
                     for (uint d = 0; d < D; d++) {
                         uint q_off = q_base + d * nb00;

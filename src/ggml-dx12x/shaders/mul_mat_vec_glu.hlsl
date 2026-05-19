@@ -82,6 +82,23 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             float x0 = asfloat(x4.x); float x1 = asfloat(x4.y);
             float x2 = asfloat(x4.z); float x3 = asfloat(x4.w);
 
+#if NATIVE_FP16
+            vector<float16_t,4> wg0 = src0.Load<vector<float16_t,4> >(gate0_base + k * 2);
+            acc_gate0 = mad((float)wg0.x, x0, mad((float)wg0.y, x1,
+                       mad((float)wg0.z, x2, mad((float)wg0.w, x3, acc_gate0))));
+
+            vector<float16_t,4> wu0 = src2.Load<vector<float16_t,4> >(up0_base + k * 2);
+            acc_up0 = mad((float)wu0.x, x0, mad((float)wu0.y, x1,
+                    mad((float)wu0.z, x2, mad((float)wu0.w, x3, acc_up0))));
+
+            vector<float16_t,4> wg1 = src0.Load<vector<float16_t,4> >(gate1_base + k * 2);
+            acc_gate1 = mad((float)wg1.x, x0, mad((float)wg1.y, x1,
+                       mad((float)wg1.z, x2, mad((float)wg1.w, x3, acc_gate1))));
+
+            vector<float16_t,4> wu1 = src2.Load<vector<float16_t,4> >(up1_base + k * 2);
+            acc_up1 = mad((float)wu1.x, x0, mad((float)wu1.y, x1,
+                    mad((float)wu1.z, x2, mad((float)wu1.w, x3, acc_up1))));
+#else
             uint2 wg0 = src0.Load2(gate0_base + k * 2);
             acc_gate0 = mad(f16tof32(wg0.x & 0xFFFFu), x0, mad(f16tof32(wg0.x >> 16), x1,
                        mad(f16tof32(wg0.y & 0xFFFFu), x2, mad(f16tof32(wg0.y >> 16), x3, acc_gate0))));
@@ -97,6 +114,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             uint2 wu1 = src2.Load2(up1_base + k * 2);
             acc_up1 = mad(f16tof32(wu1.x & 0xFFFFu), x0, mad(f16tof32(wu1.x >> 16), x1,
                     mad(f16tof32(wu1.y & 0xFFFFu), x2, mad(f16tof32(wu1.y >> 16), x3, acc_up1))));
+#endif
         }
         for (; k < K; k++) {
             float x = asfloat(src1.Load(x_base + k * 4));

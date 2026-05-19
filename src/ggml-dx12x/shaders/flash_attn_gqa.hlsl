@@ -133,6 +133,9 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             uint k_base = src1_offset + kv * nb11 + kv_head * nb12 + batch_idx * nb13;
 
             bool ctg_f32 = (src0_esize == 4 && nb00 == 4 && nb10 == 4);
+#if NATIVE_FP16
+            bool ctg_qf32_kf16 = (src0_esize == 4 && nb00 == 4 && src1_esize == 2 && nb10 == 2);
+#endif
 
             [loop] for (uint g = 0; g < gqa_ratio; g++) {
                 float mv = 0.0f;
@@ -151,6 +154,19 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
                         if (d < D) {
                             dot += asfloat(src0.Load(q_base[g] + d * 4)) * asfloat(src1.Load(k_base + d * 4));
                         }
+#if NATIVE_FP16
+                    } else if (ctg_qf32_kf16) {
+                        uint d = 0;
+                        for (; d + 3 < D; d += 4) {
+                            uint4 qp = src0.Load4(q_base[g] + d * 4);
+                            vector<float16_t,4> kh = src1.Load<vector<float16_t,4> >(k_base + d * 2);
+                            dot = mad(asfloat(qp.x), (float)kh.x, mad(asfloat(qp.y), (float)kh.y,
+                                  mad(asfloat(qp.z), (float)kh.z, mad(asfloat(qp.w), (float)kh.w, dot))));
+                        }
+                        for (; d < D; d++) {
+                            dot += asfloat(src0.Load(q_base[g] + d * 4)) * load_auto(src1, k_base + d * 2, 2);
+                        }
+#endif
                     } else {
                         for (uint d = 0; d < D; d++) {
                             dot += load_auto(src0, q_base[g] + d * nb00, src0_esize)

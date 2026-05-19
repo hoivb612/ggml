@@ -1,12 +1,19 @@
-// mul_mat_vec_q4k_dp4a.hlsl - dp4a-accelerated Q4_K matvec (M=1)
+// mul_mat_id_q4k_dp4a.hlsl -- dp4a-accelerated MUL_MAT_ID Q4_K.
 //
-// Uses dot4add_i8packed (SM 6.4) for integer dot products.
-// Processes 2 output rows per workgroup, sharing Q8_1 activation loads.
-// src1 is pre-quantized Q8_1 data in a scratch buffer.
+// Adapted from mul_mat_vec_q4k_dp4a.hlsl with MUL_MAT_ID indexing:
+//   - group_id.z decodes into (i1, i2, i3) where i1 is the used-expert axis
+//   - src2 holds the ids buffer; expert_id picks the per-expert weight slab
+//   - Q8_1 src1 is laid out flat over [k_block, i1, i2, i3], so the
+//     per-(i1,i2,i3) Q8_1 base picks up an extra ne11 dim
+//   - no bias fusion path (MUL_MAT_ID never fuses bias on this backend)
 //
-// Q8_1 block (36 bytes): ds(2xf16 packed) + qs[32](int8 packed as 8 x uint32)
+// 2 output rows per workgroup; 256 threads cooperate per super-block via
+// it_size=16 striding (16 threads per super-block, 4 dp4a per thread).
 //
-// Dispatch: groups_x = (N+1)/2, groups_y = 1, groups_z = batch*ne2*ne3
+// Dispatch (CPU side: GGML_OP_MUL_MAT_ID dp4a path):
+//   groups_x = (N + 1) / 2        (2 rows per group, 2D fallback if > 65535)
+//   groups_y = 1
+//   groups_z = ne1 * ne2 * ne3    (used_experts * tokens * 1)
 
 #include "ggml_common.hlsli"
 
@@ -18,11 +25,7 @@
 #define Q8_1_BSIZE  36
 #define NUM_ROWS    2
 
-// Wave-portable reduction LDS. Two separate per-row arrays so the tid==0
-// final sum can index 0..num_waves-1 without an offset. Sized for the worst
-// case (GROUP_SIZE=256, HW wave=4) → 64 waves/row.
-groupshared float shared_acc0[64];
-groupshared float shared_acc1[64];
+groupshared float shared_acc[64];
 
 // Decode Q4_K scales for one row's block. Produces sc0..sc7.
 void decode_q4k_row(uint block_off, uint v_im, uint q_offset,
@@ -95,24 +98,36 @@ float compute_dp4a_row(float dall, float dmin,
 void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
     uint row0 = group_x_2d(group_id) * NUM_ROWS;
     if (row0 >= ne0) return;
-    uint flat_batch = group_id.z;
-    uint i2 = flat_batch % ne2;
-    uint i3 = flat_batch / ne2;
 
-    uint i2_src0 = i2 * ne02 / ne2;
+    // MUL_MAT_ID: group_id.z is flat over (i1, i2, i3) where i1 is used-expert
+    uint flat_batch = group_id.z;
+    uint i1 = flat_batch % ne1;
+    uint tmp_b = flat_batch / ne1;
+    uint i2 = tmp_b % ne2;
+    uint i3 = tmp_b / ne2;
+
+    // Expert id for this output column (constant across NUM_ROWS rows
+    // and across all threads in the group).
+    uint ids_off  = op0 + i1 * op1 + i2 * op2;
+    int expert_id = asint(src2.Load(ids_off));
+
     uint i3_src0 = i3 * ne03 / ne3;
 
     uint K = ne00;
     uint num_blocks = K / QK_K;
     uint num_q8_per_vec = K / 32;
 
-    uint src0_base = src0_offset + i2_src0 * nb02 + i3_src0 * nb03;
+    uint src0_base = src0_offset + (uint)expert_id * nb02 + i3_src0 * nb03;
     uint src0_row0 = src0_base + row0 * nb01;
     uint src0_row1 = src0_base + (row0 + 1) * nb01;
 
+    // Q8_1 is flat over [k_block, i1, i2, i3] in row-major C order.
+    // Per-(i1,i2,i3) block-row base picks up an extra ne11 dim vs MUL_MAT.
+    uint i1_q8 = i1 * ne11 / ne1;
     uint i2_q8 = i2 * ne12 / ne2;
     uint i3_q8 = i3 * ne13 / ne3;
-    uint q8_vec_base = src1_offset + (i3_q8 * ne12 + i2_q8) * num_q8_per_vec * Q8_1_BSIZE;
+    uint q8_vec_base = src1_offset +
+        (((i3_q8 * ne12 + i2_q8) * ne11) + i1_q8) * num_q8_per_vec * Q8_1_BSIZE;
 
     uint it_size = GROUP_SIZE / 16;
     uint itid = tid % 16;
@@ -188,38 +203,34 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
         }
     }
 
-    // Wave-portable reduction. Uses WaveGetLaneCount() (runtime) instead of
-    // compile-time WARP_SIZE, and a linear final sum on tid==0 instead of a
-    // tree reduction (no power-of-2 num_waves requirement). Required for
-    // correctness on Intel UHD (wave=8) where the compiled WARP_SIZE doesn't
-    // match the HW wave size and the previous WaveIsFirstLane()-keyed LDS
-    // writes raced. The final num_waves-step linear sum on a single thread
-    // is ≤64 adds — negligible vs the dp4a accumulation upstream.
+    // Two-level reduction with tree reduction (matches mul_mat_vec dp4a)
     float wave_sum0 = WaveActiveSum(acc0);
     float wave_sum1 = WaveActiveSum(acc1);
-    uint wave_lanes = WaveGetLaneCount();
-    uint wave_id = tid / wave_lanes;
-    uint num_waves = (GROUP_SIZE + wave_lanes - 1) / wave_lanes;
-    if (num_waves == 0) num_waves = 1;
+    uint wave_id = tid / WARP_SIZE;
+    uint num_waves = GROUP_SIZE / WARP_SIZE;
 
     if (WaveIsFirstLane()) {
-        shared_acc0[wave_id] = wave_sum0;
-        shared_acc1[wave_id] = wave_sum1;
+        shared_acc[wave_id] = wave_sum0;
+        shared_acc[32 + wave_id] = wave_sum1;
     }
     GroupMemoryBarrierWithGroupSync();
 
+    for (uint s = num_waves / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_acc[tid] += shared_acc[tid + s];
+            shared_acc[32 + tid] += shared_acc[32 + tid + s];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
     if (tid == 0) {
-        float result0 = shared_acc0[0];
-        for (uint w = 1; w < num_waves; w++) result0 += shared_acc0[w];
-        result0 += load_fused_bias(row0, i2, i3);
-        uint off_d0 = offset_4d(row0, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
+        float result0 = shared_acc[0];
+        uint off_d0 = offset_4d(row0, i1, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
         store_auto(dst, off_d0, result0, dst_esize);
 
         if (row0 + 1 < ne0) {
-            float result1 = shared_acc1[0];
-            for (uint w = 1; w < num_waves; w++) result1 += shared_acc1[w];
-            result1 += load_fused_bias(row0 + 1, i2, i3);
-            uint off_d1 = offset_4d(row0 + 1, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
+            float result1 = shared_acc[32];
+            uint off_d1 = offset_4d(row0 + 1, i1, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
             store_auto(dst, off_d1, result1, dst_esize);
         }
     }
